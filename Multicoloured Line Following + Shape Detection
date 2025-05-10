@@ -1,0 +1,326 @@
+from picamera2 import Picamera2
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import os
+import time
+import math
+
+# Initialize camera
+picam2 = Picamera2()
+config = picam2.create_preview_configuration(main={"format": 'RGB888', "size": (640, 480)})
+picam2.configure(config)
+picam2.set_controls({"AwbMode": 0})  # Manual white balance
+picam2.set_controls({"ColourGains": (1.5, 1.5)})
+picam2.start()
+
+# Motor GPIO setup (unchanged)
+motor_in1 = 17
+motor_in2 = 18
+motor_in3 = 22
+motor_in4 = 23
+ENA = 12
+ENB = 13
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup([motor_in1, motor_in2, motor_in3, motor_in4, ENA, ENB], GPIO.OUT)
+pwm1 = GPIO.PWM(ENA, 1000)
+pwm2 = GPIO.PWM(ENB, 1000)
+pwm1.start(0)
+pwm2.start(0)
+
+move_speed = 35
+turn_speed = 65
+
+def set_speed(speed):
+    pwm1.ChangeDutyCycle(speed)
+    pwm2.ChangeDutyCycle(speed)
+
+def move_left():
+    GPIO.output(motor_in1, GPIO.LOW)
+    GPIO.output(motor_in2, GPIO.HIGH)
+    GPIO.output(motor_in3, GPIO.HIGH)
+    GPIO.output(motor_in4, GPIO.LOW)
+    pwm1.ChangeDutyCycle(75)
+    pwm2.ChangeDutyCycle(40)
+    print("Turning Left")
+
+def move_right():
+    GPIO.output(motor_in1, GPIO.HIGH)
+    GPIO.output(motor_in2, GPIO.LOW)
+    GPIO.output(motor_in3, GPIO.LOW)
+    GPIO.output(motor_in4, GPIO.HIGH)
+    pwm1.ChangeDutyCycle(40)
+    pwm2.ChangeDutyCycle(75)
+    print("Turning Right")
+
+def move_forward():
+    GPIO.output(motor_in1, GPIO.HIGH)
+    GPIO.output(motor_in2, GPIO.LOW)
+    GPIO.output(motor_in3, GPIO.HIGH)
+    GPIO.output(motor_in4, GPIO.LOW)
+    pwm1.ChangeDutyCycle(35)
+    pwm2.ChangeDutyCycle(35)
+    print("Moving Forward")
+
+def move_backward():
+    set_speed(50)
+    GPIO.output(motor_in1, GPIO.LOW)
+    GPIO.output(motor_in2, GPIO.HIGH)
+    GPIO.output(motor_in3, GPIO.LOW)
+    GPIO.output(motor_in4, GPIO.HIGH)
+    print("Moving Backward Slowly")
+
+def stop():
+    set_speed(0)
+    GPIO.output(motor_in1, GPIO.LOW)
+    GPIO.output(motor_in2, GPIO.LOW)
+    GPIO.output(motor_in3, GPIO.LOW)
+    GPIO.output(motor_in4, GPIO.LOW)
+    print("Stopping")
+
+# HSV color ranges (unchanged for line detection)
+color_ranges = {
+    "yellow": ([20, 80, 80], [35, 255, 255]),
+    "dark_blue": ([100, 180, 80], [130, 255, 255]),
+    "red1": ([0, 120, 100], [10, 255, 255]),
+    "red2": ([170, 120, 100], [180, 255, 255]),
+    "green": ([40, 40, 40], [90, 255, 255]),
+    "black":([0,0,0],[180,255,60]),
+}
+
+# Updated color ranges for shape detection
+shape_color_ranges = {
+    "blue":([100,100,100],[130,255,255]),
+    "red1": ([0, 120, 70], [10, 255, 255]),    # Red for pentagon/circle
+    "red2": ([170, 120, 70], [180, 255, 255]), # Second red range
+    "green": ([40, 80, 100], [90, 255, 255]),   # Tighter green for three-quarter circle
+}
+
+color_display = {
+    "yellow": (0, 255, 255),
+    "dark_blue": (255, 0, 0),
+    "black": (50, 50, 50),
+    "red": (0, 0, 255),  # Added for red shapes
+    "green": (0, 255, 0), # Added for green shapes
+}
+
+def detect_shape(contour):
+    
+    peri = cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, 0.035 * peri, True)
+    vertices = len(approx)
+    
+    area = cv2.contourArea(contour)
+    if area > 0:
+        circularity = 4 * math.pi * area / (peri * peri)
+    else:
+        circularity = 0
+    
+    # Adjusted circularity for three-quarter circle
+    if vertices >= 6 and circularity < 0.80:
+        return "three_quarter_circle"
+    elif vertices >= 8 and circularity >= 0.80:
+        return "circle"
+    elif vertices == 3:
+        return "triangle"
+    elif vertices == 4:
+        return "rectangle"
+    elif vertices == 5:
+        return "pentagon"
+    elif vertices == 6:
+        return "hexagon"
+    else:
+        return None
+
+print("Press 'q' to exit.")
+
+last_detected_color = None
+last_detection_time = time.time()
+last_shape_time = 0
+shape_stop_duration = 3  # seconds to stop when shape detected
+shape_detected = False
+pending_direction = None
+line_center_history = []  # For temporal smoothing
+
+try:
+    while True:
+        frame = picam2.capture_array()
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        roi = hsv[120:480, :]
+
+        direction = None
+        detected = False
+        box_color = (255, 255, 255)
+        shape_name = None
+
+        current_time = time.time()
+        if shape_detected and current_time - last_shape_time < shape_stop_duration:
+            stop()
+            direction = f"Stopped for shape: {shape_name}"
+        else:
+            shape_detected = False
+
+        # Shape detection with color filtering
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        combined_mask = np.zeros_like(hsv_frame[:, :, 0])
+        for color in ["red1", "green","blue"]:
+            lower = np.array(shape_color_ranges[color][0])
+            upper = np.array(shape_color_ranges[color][1])
+            mask = cv2.inRange(hsv_frame, lower, upper)
+            # Apply morphological operations to reduce noise
+            kernel = np.ones((5, 5), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            combined_mask = cv2.bitwise_or(combined_mask, mask)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_masked = cv2.bitwise_and(gray, gray, mask=combined_mask)
+        blurred = cv2.GaussianBlur(gray_masked, (5, 5), 0)
+        edges = cv2.Canny(blurred, 30, 80)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = [cnt for cnt in contours if cv2.contourArea(cnt) > 100]  
+
+        for cnt in contours
+            shape = detect_shape(cnt)
+            if shape in ["pentagon", "circle", "three_quarter_circle","triangle","hexagon","rectangle"]:
+                shape_name = shape
+                if not shape_detected:
+                    shape_detected = True
+                    last_shape_time = current_time
+                direction = f"Detected shape: {shape_name}"
+                break
+
+        # Line detection
+        if not shape_detected or current_time - last_shape_time >= shape_stop_duration:
+            for color in ["yellow", "dark_blue","black"]:
+                lower = np.array(color_ranges[color][0])
+                upper = np.array(color_ranges[color][1])
+                mask = cv2.inRange(roi, lower, upper)
+                color_name = color
+
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                contours = [cnt for cnt in contours if cv2.contourArea(cnt) > 400]
+
+                if contours:
+                    contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3], reverse=True)
+                    largest = contours[0]
+                    x, y, w, h = cv2.boundingRect(largest)
+                    M = cv2.moments(largest)
+                    if M["m00"] > 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        line_center = cx
+                    else:
+                        line_center = x + w // 2
+                        cy = y + h // 2
+
+                    frame_center = mask.shape[1] // 2
+
+                    if color_name != last_detected_color and time.time() - last_detection_time < 0.2:
+                        continue
+                    else:
+                        last_detected_color = color_name
+                        last_detection_time = time.time()
+
+                    if line_center < frame_center - 100:
+                        direction = f"{color_name} - Turn right"
+                        if not shape_detected:
+                            move_right()
+                    elif line_center > frame_center + 100:
+                        direction = f"{color_name} - Turn left"
+                        if not shape_detected:
+                            move_left()
+                    else:
+                        direction = f"{color_name} - Go straight"
+                        if not shape_detected:
+                            move_forward()
+
+                    box_color = color_display[color_name]
+                    break
+            else:
+                # Black line detection with noise reduction
+                roi_color = frame[240:480, :]
+                hsv_roi = cv2.cvtColor(roi_color, cv2.COLOR_BGR2HSV)
+
+                red_mask1 = cv2.inRange(hsv_roi, np.array(color_ranges["red1"][0]), np.array(color_ranges["red1"][1]))
+                red_mask2 = cv2.inRange(hsv_roi, np.array(color_ranges["red2"][0]), np.array(color_ranges["red2"][1]))
+                green_mask = cv2.inRange(hsv_roi, np.array(color_ranges["green"][0]), np.array(color_ranges["green"][1]))
+
+                combined_mask = cv2.bitwise_or(red_mask1, red_mask2)
+                combined_mask = cv2.bitwise_or(combined_mask, green_mask)
+
+                roi_masked = roi_color.copy()
+                roi_masked[combined_mask > 0] = (255, 255, 255)
+
+                gray = cv2.cvtColor(roi_masked, cv2.COLOR_BGR2GRAY)
+                # Adaptive thresholding to reduce noise
+                threshold = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+                # Morphological operations
+                kernel = np.ones((5, 5), np.uint8)
+                threshold = cv2.morphologyEx(threshold, cv2.MORPH_OPEN, kernel)
+
+                contours, _ = cv2.findContours(threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                contours = [cnt for cnt in contours if cv2.contourArea(cnt) > 500]
+
+                if contours:
+                    largest = max(contours, key=cv2.contourArea)
+                    x, y, w, h = cv2.boundingRect(largest)
+                    M = cv2.moments(largest)
+                    if M["m00"] > 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        line_center = cx
+                    else:
+                        line_center = x + w // 2
+                        cy = y + h // 2
+
+                    # Temporal smoothing of line center
+                    line_center_history.append(line_center)
+                    if len(line_center_history) > 5:
+                        line_center_history.pop(0)
+                    line_center = int(np.mean(line_center_history))
+
+                    frame_center = threshold.shape[1] // 2
+
+                    if line_center < frame_center - 80:
+                        direction = "black - Turn Right"
+                        if not shape_detected:
+                            move_right()
+                    elif line_center > frame_center + 80:
+                        direction = "black - Turn Left"
+                        if not shape_detected:
+                            move_left()
+                    else:
+                        direction = "black - Go Straight"
+                        if not shape_detected:
+                            move_forward()
+
+                    box_color = color_display["black"]
+                else:
+                    direction = "No Line"
+                    if not shape_detected:
+                        move_backward()
+
+        if "DISPLAY" in os.environ:
+            display_frame = frame.copy()
+            if direction and 'x' in locals() and not shape_detected:
+                cv2.rectangle(display_frame, (x, y + 120), (x + w, y + h + 120), box_color, 2)
+                cv2.circle(display_frame, (line_center, cy + 120), 5, (0, 0, 255), -1)
+                cv2.putText(display_frame, direction, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, box_color, 2)
+            if shape_name:
+                cv2.putText(display_frame, shape_name, (450, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.imshow("Line Following", display_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except KeyboardInterrupt:
+    print("Interrupted!")
+
+finally:
+    stop()
+    pwm1.stop()
+    pwm2.stop()
+    cv2.destroyAllWindows()
+    picam2.stop()
+    GPIO.cleanup()

@@ -1,0 +1,160 @@
+from picamera2 import Picamera2
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import os
+
+# Initialize camera
+picam2 = Picamera2()
+config = picam2.create_preview_configuration()
+picam2.configure(config)
+picam2.start()
+
+# Define motor driver GPIO pins
+motor_in1 = 17  # Left motor forward
+motor_in2 = 18  # Left motor backward
+motor_in3 = 22  # Right motor forward
+motor_in4 = 23  # Right motor backward
+
+# PWM pins for speed control
+ENA = 12  # Left motor speed control
+ENB = 13  # Right motor speed control
+
+# Setup GPIO Mode
+GPIO.setmode(GPIO.BCM)
+GPIO.setup([motor_in1, motor_in2, motor_in3, motor_in4, ENA, ENB], GPIO.OUT)
+
+# Setup PWM for speed control (frequency: 1kHz)
+pwm1 = GPIO.PWM(ENA, 1000)  # Left motor PWM
+pwm2 = GPIO.PWM(ENB, 1000)  # Right motor PWM
+pwm1.start(0)
+pwm2.start(0)
+
+# Speed settings
+move_speed = 45  # Speed for forward movement
+turn_speed = 65  # Speed for left/right turns
+backward_speed = 35  # Slow backward speed
+
+def set_speed(left_speed, right_speed):
+    pwm1.ChangeDutyCycle(left_speed)
+    pwm2.ChangeDutyCycle(right_speed)
+
+def move_right():
+    set_speed(35, 70)  # Slow left motor, speed up right motor
+    GPIO.output(motor_in1, GPIO.LOW)
+    GPIO.output(motor_in2, GPIO.HIGH)
+    GPIO.output(motor_in3, GPIO.HIGH)
+    GPIO.output(motor_in4, GPIO.LOW)
+    print("Turning Left")
+
+def move_left():
+    set_speed(70, 35)  # Slow right motor, speed up left motor
+    GPIO.output(motor_in1, GPIO.HIGH)
+    GPIO.output(motor_in2, GPIO.LOW)
+    GPIO.output(motor_in3, GPIO.LOW)
+    GPIO.output(motor_in4, GPIO.HIGH)
+    print("Turning Right")
+
+def move_forward():
+    set_speed(move_speed, move_speed)
+    GPIO.output(motor_in1, GPIO.HIGH)
+    GPIO.output(motor_in2, GPIO.LOW)
+    GPIO.output(motor_in3, GPIO.HIGH)
+    GPIO.output(motor_in4, GPIO.LOW)
+    print("Moving Forward")
+
+def move_backward():
+    set_speed(backward_speed, backward_speed)
+    GPIO.output(motor_in1, GPIO.LOW)
+    GPIO.output(motor_in2, GPIO.HIGH)
+    GPIO.output(motor_in3, GPIO.LOW)
+    GPIO.output(motor_in4, GPIO.HIGH)
+    print("Moving Backward Slowly")
+
+def stop():
+    set_speed(0, 0)
+    GPIO.output(motor_in1, GPIO.LOW)
+    GPIO.output(motor_in2, GPIO.LOW)
+    GPIO.output(motor_in3, GPIO.LOW)
+    GPIO.output(motor_in4, GPIO.LOW)
+    print("Stopping")
+
+print("Press 'q' to exit the live feed.")
+
+try:
+    while True:
+        # Capture frame
+        frame = picam2.capture_array()
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Apply Binary Threshold for Black Line on White Background
+        _, threshold = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
+
+        # Convert threshold image to BGR for color display
+        threshold_colored = cv2.cvtColor(threshold, cv2.COLOR_GRAY2BGR)
+
+        # Get frame dimensions
+        height, width = threshold.shape
+        center_x = width // 2
+
+        # Find contours
+        contours, _ = cv2.findContours(threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if contours:
+            # Find the largest contour (assumed to be the line)
+            largest_contour = max(contours, key=cv2.contourArea)
+
+            # Get the bounding box of the contour
+            x, y, w, h = cv2.boundingRect(largest_contour)
+
+            # Compute the centroid of the contour
+            M = cv2.moments(largest_contour)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+            else:
+                cx = center_x  # Default to middle of the frame
+
+            # Draw the bounding box and centroid
+            cv2.rectangle(threshold_colored, (x, y), (x + w, y + h), (0, 255, 255), 2)
+            cv2.circle(threshold_colored, (cx, cy), 5, (0, 0, 255), -1)
+
+            # Steering logic based on contour centroid
+            if cx < center_x - 50:  # Too far left
+                move_left()
+                direction = "Turn Left"
+            elif cx > center_x + 50:  # Too far right
+                move_right()
+                direction = "Turn Right"
+            else:
+                move_forward()
+                direction = "Go Straight"
+
+        else:
+            move_backward()  # Instead of stopping, move backward slowly
+            direction = "No Path Detected - Moving Backward"
+
+        # Display direction text
+        cv2.putText(threshold_colored, direction, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+
+        # Show the processed image
+        if "DISPLAY" in os.environ:
+            cv2.imshow("Line Detection", threshold_colored)
+
+        # Press 'q' to exit
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except KeyboardInterrupt:
+    print("Stopping robot...")
+
+except Exception as e:
+    print("Error:", e)
+
+# Cleanup
+stop()
+cv2.destroyAllWindows()
+picam2.stop()
+GPIO.cleanup()

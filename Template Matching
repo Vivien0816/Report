@@ -1,0 +1,70 @@
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+
+# Initialize Picamera2
+picam2 = Picamera2()
+picam2.preview_configuration.main.size = (640, 480)  # Adjust resolution
+picam2.preview_configuration.main.format = "RGB888"
+picam2.configure("preview")
+picam2.start()
+
+# Load template images (Ensure the images are stored in the 'templates/' folder)
+templates = {
+    "left_arrow": cv2.imread("/home/user/Desktop/template/left.jpeg", 0),
+    "right_arrow": cv2.imread("/home/user/Desktop/template/right.jpeg", 0),
+    "up_arrow": cv2.imread("/home/user/Desktop/template/forward.jpeg", 0),
+    "down_arrow": cv2.imread("/home/user/Desktop/template/backward.jpeg", 0),
+    "distance": cv2.imread("/home/user/Desktop/template/distance.jpeg", 0),
+    "traffic": cv2.imread("/home/user/Desktop/template/traffic.jpeg", 0),
+    "facerecognition": cv2.imread("/home/user/Desktop/template/facerecognition.jpeg", 0),
+    "rectangle": cv2.imread("/home/user/Desktop/template/rectangle.jpeg", 0),
+    "triangle": cv2.imread("/home/user/Desktop/template/triangle.jpeg", 0),
+    "hexagon": cv2.imread("/home/user/Desktop/template/hexagon.jpeg", 0),
+    "pentagon": cv2.imread("/home/user/Desktop/template/pentagon.jpeg", 0),
+    "circle": cv2.imread("/home/user/Desktop/template/circle.jpeg", 0),
+    "threequarter": cv2.imread("/home/user/Desktop/template/threequarter.jpeg", 0),
+    "stop": cv2.imread("/home/user/Desktop/template/stop.jpeg", 0),
+
+}
+
+# Template matching function
+def match_template(frame, templates):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    best_match = None
+    best_value = 0.0
+
+    for name, template in templates.items():
+        res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+
+        if max_val > best_value and max_val > 0.6:  # Threshold for match confidence
+            best_value = max_val
+            best_match = (name, max_loc, template.shape)
+
+    return best_match
+
+# Real-time detection loop
+while True:
+    frame = picam2.capture_array()
+    match = match_template(frame, templates)
+
+    if match:
+        name, loc, template_size = match
+        top_left = loc
+        bottom_right = (top_left[0] + template_size[1], top_left[1] + template_size[0])
+        cv2.rectangle(frame, top_left, bottom_right, (0, 255, 0), 2)
+        cv2.putText(frame, name, (top_left[0], top_left[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    # Display the frame
+    cv2.imshow("Symbol Recognition", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+# Cleanup
+cv2.destroyAllWindows()
+picam2.stop()
+
+
